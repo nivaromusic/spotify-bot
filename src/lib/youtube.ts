@@ -1,6 +1,6 @@
 /**
- * YouTube Search Integration
- * جستجو و دانلود آهنگ از یوتیوب
+ * YouTube Search + Download
+ * جستجو و دانلود آهنگ از یوتوب با yt-dlp
  */
 
 import { exec } from "child_process";
@@ -17,73 +17,101 @@ export interface YoutubeSearchResult {
   url: string;
 }
 
-// جستجوی آهنگ در یوتیوب با استفاده از YouTube Data API
+// ── جستجوی تک‌نتیجه (برای سازگاری با کد قدیم) ────────────────
+
 export async function searchYouTube(
   query: string
 ): Promise<YoutubeSearchResult | null> {
-  const apiKey = process.env.YOUTUBE_API_KEY;
-
-  if (!apiKey) {
-    // fallback: استفاده از yt-dlp برای جستجو
-    return searchYouTubeWithYtDlp(query);
-  }
-
-  try {
-    const encodedQuery = encodeURIComponent(query);
-    const response = await fetch(
-      `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodedQuery}&type=video&maxResults=1&key=${apiKey}`
-    );
-
-    if (!response.ok) return null;
-
-    const data = await response.json() as {
-      items: Array<{
-        id: { videoId: string };
-        snippet: { title: string };
-      }>;
-    };
-
-    if (!data.items || data.items.length === 0) return null;
-
-    const item = data.items[0];
-    return {
-      videoId: item.id.videoId,
-      title: item.snippet.title,
-      url: `https://www.youtube.com/watch?v=${item.id.videoId}`,
-    };
-  } catch {
-    return searchYouTubeWithYtDlp(query);
-  }
+  const results = await searchYouTubeMultiple(query, 1);
+  return results[0] || null;
 }
 
-// جستجو با yt-dlp (بدون API key)
-async function searchYouTubeWithYtDlp(
-  query: string
-): Promise<YoutubeSearchResult | null> {
+// ── جستجوی چند نتیجه ─────────────────────────────────────────
+
+export async function searchYouTubeMultiple(
+  query: string,
+  maxResults: number = 5
+): Promise<YoutubeSearchResult[]> {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+
+  // اگه YOUTUBE_API_KEY داری، از Data API استفاده کن
+  if (apiKey) {
+    try {
+      const encodedQuery = encodeURIComponent(query);
+      const response = await fetch(
+        `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodedQuery}&type=video&maxResults=${maxResults}&key=${apiKey}`
+      );
+
+      if (response.ok) {
+        const data = (await response.json()) as {
+          items?: Array<{
+            id: { videoId: string };
+            snippet: { title: string };
+          }>;
+        };
+
+        if (data.items && data.items.length > 0) {
+          return data.items
+            .filter((item) => item.id?.videoId)
+            .map((item) => ({
+              videoId: item.id.videoId,
+              title: item.snippet.title,
+              url: `https://www.youtube.com/watch?v=${item.id.videoId}`,
+            }));
+        }
+      }
+    } catch (err) {
+      console.error("YouTube Data API error:", err);
+    }
+  }
+
+  // fallback: yt-dlp
+  return searchYouTubeMultipleWithYtDlp(query, maxResults);
+}
+
+// ── جستجو با yt-dlp ─────────────────────────────────────────
+
+async function searchYouTubeMultipleWithYtDlp(
+  query: string,
+  maxResults: number
+): Promise<YoutubeSearchResult[]> {
   try {
     const ytDlpPath = await getYtDlpPath();
     const { stdout } = await execAsync(
-      `${ytDlpPath} "ytsearch1:${query}" --get-id --get-title --no-playlist 2>/dev/null`,
-      { timeout: 30000 }
+      `${ytDlpPath} "ytsearch${maxResults}:${query}" --get-id --get-title --no-playlist 2>/dev/null`,
+      { timeout: 45000 }
     );
 
-    const lines = stdout.trim().split("\n").filter((l) => l.trim());
-    if (lines.length >= 2) {
-      const title = lines[0];
-      const videoId = lines[1];
-      return {
-        videoId,
-        title,
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-      };
+    const lines = stdout
+      .trim()
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    const results: YoutubeSearchResult[] = [];
+
+    // yt-dlp با --get-id --get-title: خط اول title، خط دوم id
+    for (let i = 0; i < lines.length - 1; i += 2) {
+      const title = lines[i];
+      const videoId = lines[i + 1];
+      if (title && videoId && videoId.length === 11) {
+        results.push({
+          videoId,
+          title,
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+        });
+      }
     }
-    return null;
-  } catch {
-    return null;
+
+    return results;
+  } catch (err) {
+    console.error("yt-dlp search failed:", err);
+    return [];
   }
 }
 
-// پیدا کردن مسیر yt-dlp
+// ── پیدا کردن مسیر yt-dlp ───────────────────────────────────
+
 async function getYtDlpPath(): Promise<string> {
   const paths = [
     "/usr/local/bin/yt-dlp",
@@ -101,10 +129,11 @@ async function getYtDlpPath(): Promise<string> {
     }
   }
 
-  throw new Error("yt-dlp not found. Please install it: pip install yt-dlp");
+  throw new Error("yt-dlp not found. Please install it.");
 }
 
-// دانلود آهنگ از یوتیوب
+// ── دانلود آهنگ از یوتوب ────────────────────────────────────
+
 export async function downloadFromYouTube(
   videoUrl: string,
   outputDir: string,
@@ -113,7 +142,6 @@ export async function downloadFromYouTube(
   const ytDlpPath = await getYtDlpPath();
   const outputPath = path.join(outputDir, `${filename}.%(ext)s`);
 
-  // دانلود بهترین کیفیت صدا و تبدیل به MP3
   const command = [
     ytDlpPath,
     `"${videoUrl}"`,
@@ -126,28 +154,34 @@ export async function downloadFromYouTube(
     "--no-warnings",
   ].join(" ");
 
-  await execAsync(command, { timeout: 120000 });
+  await execAsync(command, { timeout: 180000 });
 
   const mp3Path = path.join(outputDir, `${filename}.mp3`);
 
-  if (!fs.existsSync(mp3Path)) {
-    // ممکنه با پسوند دیگه ذخیره شده باشه
-    const files = fs.readdirSync(outputDir);
-    const audioFile = files.find(
-      (f) =>
-        f.startsWith(filename) &&
-        (f.endsWith(".mp3") || f.endsWith(".m4a") || f.endsWith(".opus"))
-    );
-    if (audioFile) {
-      return path.join(outputDir, audioFile);
-    }
-    throw new Error("Downloaded file not found");
+  if (fs.existsSync(mp3Path)) {
+    return mp3Path;
   }
 
-  return mp3Path;
+  // اگه پسوند فرق داشت
+  const files = fs.readdirSync(outputDir);
+  const audioFile = files.find(
+    (f) =>
+      f.startsWith(filename) &&
+      (f.endsWith(".mp3") ||
+        f.endsWith(".m4a") ||
+        f.endsWith(".opus") ||
+        f.endsWith(".webm"))
+  );
+
+  if (audioFile) {
+    return path.join(outputDir, audioFile);
+  }
+
+  throw new Error("Downloaded file not found");
 }
 
-// دانلود مستقیم با spotdl (اگر نصب باشه)
+// ── دانلود مستقیم با spotdl (اختیاری) ───────────────────────
+
 export async function downloadWithSpotdl(
   spotifyUrl: string,
   outputDir: string
@@ -158,7 +192,6 @@ export async function downloadWithSpotdl(
       { timeout: 180000 }
     );
 
-    // پیدا کردن فایل دانلود شده
     const match = stdout.match(/Downloaded "(.+?)"/);
     if (match) {
       const files = fs.readdirSync(outputDir);
