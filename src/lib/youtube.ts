@@ -17,7 +17,7 @@ export interface YoutubeSearchResult {
   url: string;
 }
 
-// ── جستجوی تک‌نتیجه (برای سازگاری با کد قدیم) ────────────────
+// ── جستجوی تک‌نتیجه ─────────────────────────────────────────
 
 export async function searchYouTube(
   query: string
@@ -34,7 +34,6 @@ export async function searchYouTubeMultiple(
 ): Promise<YoutubeSearchResult[]> {
   const apiKey = process.env.YOUTUBE_API_KEY;
 
-  // اگه YOUTUBE_API_KEY داری، از Data API استفاده کن
   if (apiKey) {
     try {
       const encodedQuery = encodeURIComponent(query);
@@ -65,7 +64,6 @@ export async function searchYouTubeMultiple(
     }
   }
 
-  // fallback: yt-dlp
   return searchYouTubeMultipleWithYtDlp(query, maxResults);
 }
 
@@ -78,8 +76,8 @@ async function searchYouTubeMultipleWithYtDlp(
   try {
     const ytDlpPath = await getYtDlpPath();
     const { stdout } = await execAsync(
-      `${ytDlpPath} "ytsearch${maxResults}:${query}" --get-id --get-title --no-playlist 2>/dev/null`,
-      { timeout: 45000 }
+      `${ytDlpPath} "ytsearch${maxResults}:${query}" --get-id --get-title --no-playlist --no-warnings 2>/dev/null`,
+      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
     );
 
     const lines = stdout
@@ -90,7 +88,6 @@ async function searchYouTubeMultipleWithYtDlp(
 
     const results: YoutubeSearchResult[] = [];
 
-    // yt-dlp با --get-id --get-title: خط اول title، خط دوم id
     for (let i = 0; i < lines.length - 1; i += 2) {
       const title = lines[i];
       const videoId = lines[i + 1];
@@ -132,7 +129,7 @@ async function getYtDlpPath(): Promise<string> {
   throw new Error("yt-dlp not found. Please install it.");
 }
 
-// ── دانلود آهنگ از یوتوب ────────────────────────────────────
+// ── دانلود آهنگ از یوتوب (نسخه‌ی تقویت‌شده) ─────────────────
 
 export async function downloadFromYouTube(
   videoUrl: string,
@@ -142,27 +139,46 @@ export async function downloadFromYouTube(
   const ytDlpPath = await getYtDlpPath();
   const outputPath = path.join(outputDir, `${filename}.%(ext)s`);
 
-  const command = [
-    ytDlpPath,
+  // آرگومان‌های تقویت‌شده برای دور زدن محدودیت‌های YouTube
+  const args = [
     `"${videoUrl}"`,
     "-x",
     "--audio-format mp3",
     "--audio-quality 0",
     `--output "${outputPath}"`,
     "--no-playlist",
-    "--quiet",
     "--no-warnings",
-  ].join(" ");
+    "--no-check-certificates",
+    "--prefer-free-formats",
+    "--add-header",
+    `"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"`,
+    "--extractor-args",
+    `"youtube:player_client=android,web"`,
+    "--retries",
+    "5",
+    "--fragment-retries",
+    "5",
+  ];
 
-  await execAsync(command, { timeout: 180000 });
+  const command = `${ytDlpPath} ${args.join(" ")}`;
 
-  const mp3Path = path.join(outputDir, `${filename}.mp3`);
+  console.log("Running yt-dlp:", command);
 
-  if (fs.existsSync(mp3Path)) {
-    return mp3Path;
+  try {
+    const { stderr } = await execAsync(command, {
+      timeout: 240000,
+      maxBuffer: 50 * 1024 * 1024,
+    });
+
+    if (stderr && stderr.toLowerCase().includes("error")) {
+      console.error("yt-dlp stderr:", stderr);
+    }
+  } catch (err) {
+    console.error("yt-dlp exec error:", err);
+    throw err;
   }
 
-  // اگه پسوند فرق داشت
+  // پیدا کردن فایل دانلود‌شده
   const files = fs.readdirSync(outputDir);
   const audioFile = files.find(
     (f) =>
@@ -170,7 +186,8 @@ export async function downloadFromYouTube(
       (f.endsWith(".mp3") ||
         f.endsWith(".m4a") ||
         f.endsWith(".opus") ||
-        f.endsWith(".webm"))
+        f.endsWith(".webm") ||
+        f.endsWith(".aac"))
   );
 
   if (audioFile) {
