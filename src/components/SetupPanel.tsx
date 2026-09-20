@@ -46,21 +46,20 @@ export default function SetupPanel({ isConfigured }: Props) {
       configured: isConfigured.channel,
     },
     {
-      key: "SPOTIFY_CLIENT_ID",
-      label: "Spotify Client ID",
-      description: "از Spotify Developer Dashboard",
-      placeholder: "abc123def456...",
-      link: "https://developer.spotify.com/dashboard",
-      linkLabel: "Spotify Dashboard",
-      configured: isConfigured.spotify,
+      key: "BOT_USERNAME",
+      label: "Bot Username",
+      description: "یوزرنیم ربات بدون @ (برای نمایش در کپشن)",
+      placeholder: "Nivaromusic_spotifybot",
+      configured: !!process.env.NEXT_PUBLIC_BOT_USERNAME,
     },
     {
-      key: "SPOTIFY_CLIENT_SECRET",
-      label: "Spotify Client Secret",
-      description: "از Spotify Developer Dashboard",
-      placeholder: "xyz789...",
-      configured: isConfigured.spotify,
-      isSecret: true,
+      key: "YOUTUBE_API_KEY",
+      label: "YouTube API Key",
+      description: "اختیاری — اگه نداری، از yt-dlp استفاده می‌شه",
+      placeholder: "AIza...",
+      link: "https://console.cloud.google.com/apis/credentials",
+      linkLabel: "Google Cloud",
+      configured: false,
     },
     {
       key: "CF_ACCOUNT_ID",
@@ -99,7 +98,10 @@ export default function SetupPanel({ isConfigured }: Props) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ webhookUrl }),
       });
-      const data = await response.json() as { success: boolean; webhookUrl: string };
+      const data = (await response.json()) as {
+        success: boolean;
+        webhookUrl: string;
+      };
 
       if (data.success) {
         setResult(`✅ Webhook با موفقیت ثبت شد!\n📌 ${data.webhookUrl}`);
@@ -139,10 +141,18 @@ export default function SetupPanel({ isConfigured }: Props) {
             <div className="flex items-start justify-between gap-2">
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1">
-                  <span className={`text-sm ${config.configured ? "text-green-400" : ""}`}>
+                  <span
+                    className={`text-sm ${
+                      config.configured ? "text-green-400" : ""
+                    }`}
+                  >
                     {config.configured ? "✅" : "⬜"}
                   </span>
-                  <code className={`text-xs font-mono ${config.configured ? "text-green-300" : "text-gray-300"}`}>
+                  <code
+                    className={`text-xs font-mono ${
+                      config.configured ? "text-green-300" : "text-gray-300"
+                    }`}
+                  >
                     {config.key}
                   </code>
                 </div>
@@ -171,30 +181,32 @@ export default function SetupPanel({ isConfigured }: Props) {
       {/* .env Instructions */}
       <div className="p-4 rounded-xl bg-gray-800/60 border border-gray-700/50 mb-6">
         <p className="text-gray-400 text-sm mb-3">
-          🔧 این متغیرها رو به فایل <code className="text-green-400 bg-gray-900 px-1 rounded">.env</code> اضافه کن:
+          🔧 این متغیرها رو به فایل{" "}
+          <code className="text-green-400 bg-gray-900 px-1 rounded">.env</code>{" "}
+          اضافه کن:
         </p>
         <pre className="text-xs text-gray-400 font-mono overflow-x-auto whitespace-pre-wrap">
-{`TELEGRAM_BOT_TOKEN=your_bot_token_here
+          {`TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHANNEL_ID=@your_channel_or_-100xxxxx
 BOT_USERNAME=YourBotUsername
-SPOTIFY_CLIENT_ID=your_spotify_client_id
-SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 WEBHOOK_SECRET_TOKEN=any_random_secret_string
+
+# YouTube API (اختیاری — اگه نداری از yt-dlp استفاده می‌شه)
+YOUTUBE_API_KEY=your_youtube_api_key
 
 # Cloudflare KV (اختیاری - برای کش سریع)
 CF_ACCOUNT_ID=your_cloudflare_account_id
 CF_API_TOKEN=your_cloudflare_api_token
-CF_KV_NAMESPACE_ID=your_kv_namespace_id
-
-# YouTube API (اختیاری)
-YOUTUBE_API_KEY=your_youtube_api_key`}
+CF_KV_NAMESPACE_ID=your_kv_namespace_id`}
         </pre>
       </div>
 
       {/* Webhook Setup */}
       {isConfigured.bot && (
         <div className="p-4 rounded-xl bg-blue-900/20 border border-blue-800/30">
-          <p className="text-blue-400 font-medium text-sm mb-3">📡 ثبت Webhook تلگرام</p>
+          <p className="text-blue-400 font-medium text-sm mb-3">
+            📡 ثبت Webhook تلگرام
+          </p>
           <div className="flex gap-2">
             <input
               type="url"
@@ -212,10 +224,13 @@ YOUTUBE_API_KEY=your_youtube_api_key`}
             </button>
           </div>
           {result && (
-            <p className="text-xs mt-2 text-gray-400 whitespace-pre-line">{result}</p>
+            <p className="text-xs mt-2 text-gray-400 whitespace-pre-line">
+              {result}
+            </p>
           )}
           <p className="text-gray-600 text-xs mt-2">
-            آدرس سرور خودت رو وارد کن. ربات از <code>/api/webhook</code> استفاده می‌کنه.
+            آدرس سرور خودت رو وارد کن. ربات از{" "}
+            <code>/api/webhook</code> استفاده می‌کنه.
           </p>
         </div>
       )}
