@@ -1,6 +1,5 @@
 /**
  * Track Service - مدیریت آهنگ‌ها در دیتابیس و Cloudflare KV
- * این سرویس ترکیبی از PostgreSQL و Cloudflare KV استفاده می‌کنه
  */
 
 import { db } from "@/db";
@@ -11,7 +10,17 @@ import {
   setInCloudflareKV,
   makeTrackKey,
 } from "./cloudflare";
-import type { TrackInfo } from "./spotify";
+
+// interface محلی (به‌جای spotify.ts)
+export interface TrackInfo {
+  spotifyId: string;
+  trackName: string;
+  artistName: string;
+  albumName: string;
+  coverUrl: string;
+  durationMs: number;
+  spotifyUrl: string;
+}
 
 export interface StoredTrack {
   id: number;
@@ -26,17 +35,15 @@ export interface StoredTrack {
   downloadCount: number | null;
 }
 
-// پیدا کردن آهنگ با Spotify ID
-// اول از Cloudflare KV چک می‌کنه (سریع‌تر)، بعد از دیتابیس
+// پیدا کردن آهنگ با Spotify ID (یا yt:xxx)
 export async function findTrackBySpotifyId(
   spotifyId: string
 ): Promise<StoredTrack | null> {
-  // ۱. اول از Cloudflare KV بخوان (کش سریع)
+  // ۱. از Cloudflare KV (کش سریع)
   const cacheKey = makeTrackKey(spotifyId);
   const cached = await getFromCloudflareKV(cacheKey);
 
   if (cached && cached.telegramFileId) {
-    // اگر در کش بود، بررسی کن آیا در دیتابیس هم هست
     const dbTrack = await db
       .select()
       .from(tracks)
@@ -44,7 +51,6 @@ export async function findTrackBySpotifyId(
       .limit(1);
 
     if (dbTrack.length > 0) {
-      // آپدیت download count
       await db
         .update(tracks)
         .set({ downloadCount: sql`${tracks.downloadCount} + 1` })
@@ -54,7 +60,7 @@ export async function findTrackBySpotifyId(
     }
   }
 
-  // ۲. از دیتابیس PostgreSQL بخوان
+  // ۲. از PostgreSQL
   const result = await db
     .select()
     .from(tracks)
@@ -65,7 +71,6 @@ export async function findTrackBySpotifyId(
 
   const track = result[0];
 
-  // اگر file_id داشت، در Cloudflare KV ذخیره کن برای دفعات بعدی
   if (track.telegramFileId && track.channelMessageId) {
     await setInCloudflareKV(
       cacheKey,
@@ -79,7 +84,6 @@ export async function findTrackBySpotifyId(
         channelMessageId: track.channelMessageId,
         cachedAt: new Date().toISOString(),
       },
-      // کش ۳۰ روزه
       60 * 60 * 24 * 30
     );
   }
@@ -87,7 +91,7 @@ export async function findTrackBySpotifyId(
   return track as StoredTrack;
 }
 
-// ذخیره آهنگ جدید در دیتابیس
+// ذخیره آهنگ جدید
 export async function saveTrack(
   trackInfo: TrackInfo,
   telegramFileId: string,
@@ -119,7 +123,6 @@ export async function saveTrack(
 
   const saved = result[0] as StoredTrack;
 
-  // ذخیره در Cloudflare KV برای کش سریع
   const cacheKey = makeTrackKey(trackInfo.spotifyId);
   await setInCloudflareKV(
     cacheKey,
@@ -139,7 +142,7 @@ export async function saveTrack(
   return saved;
 }
 
-// جستجوی آهنگ در دیتابیس (برای جستجوی متنی)
+// جستجو در دیتابیس
 export async function searchTracksInDb(
   query: string
 ): Promise<StoredTrack[]> {
@@ -157,7 +160,7 @@ export async function searchTracksInDb(
   return results as StoredTrack[];
 }
 
-// ثبت درخواست کاربر در لاگ
+// ثبت درخواست کاربر
 export async function logUserRequest(data: {
   telegramUserId: number;
   telegramUsername?: string;
@@ -178,7 +181,7 @@ export async function logUserRequest(data: {
   });
 }
 
-// آمار کلی
+// آمار
 export async function getStats() {
   const [trackCount] = await db
     .select({ count: sql<number>`count(*)` })
