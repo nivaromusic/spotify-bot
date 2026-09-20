@@ -1,32 +1,35 @@
 /**
- * Telegram Bot Handler - منطق اصلی ربات
- * این فایل پردازش پیام‌های تلگرام رو انجام می‌ده
+ * Telegram Bot Handler - بدون Spotify
+ * کاربر اسم آهنگ می‌فرسته → YouTube سرچ → ۵ نتیجه → انتخاب → دانلود → ارسال
  */
 
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { extractSpotifyTrackId, getTrackInfo, searchSpotify, formatDuration } from "./spotify";
-import { searchYouTube, downloadFromYouTube } from "./youtube";
+import { searchYouTubeMultiple, downloadFromYouTube } from "./youtube";
 import {
-  findTrackBySpotifyId,
   saveTrack,
   searchTracksInDb,
+  findTrackBySpotifyId,
   logUserRequest,
 } from "./trackService";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ARCHIVE_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID; // مثلاً @my_music_archive یا -100123456789
+const ARCHIVE_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-// ارسال پیام متنی
+// cache موقت عنوان ویدیوها (تو حافظه Worker)
+const videoTitleCache = new Map<string, string>();
+
+// ── توابع پایه تلگرام ────────────────────────────────────────
+
 async function sendMessage(
   chatId: number | string,
   text: string,
   parseMode: "HTML" | "Markdown" | "MarkdownV2" = "HTML",
   replyMarkup?: object
-): Promise<void> {
+): Promise<number> {
   const body: Record<string, unknown> = {
     chat_id: chatId,
     text,
@@ -34,51 +37,72 @@ async function sendMessage(
   };
   if (replyMarkup) body.reply_markup = replyMarkup;
 
-  await fetch(`${TELEGRAM_API}/sendMessage`, {
+  const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json()) as { result?: { message_id: number } };
+  return data.result?.message_id || 0;
+}
+
+async function editMessage(
+  chatId: number | string,
+  messageId: number,
+  text: string,
+  parseMode: "HTML" | "Markdown" | "MarkdownV2" = "HTML",
+  replyMarkup?: object
+): Promise<void> {
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: parseMode,
+  };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+
+  await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 }
 
-// ویرایش پیام
-async function editMessage(
+async function deleteMessage(
   chatId: number | string,
-  messageId: number,
-  text: string,
-  parseMode: "HTML" | "Markdown" | "MarkdownV2" = "HTML"
+  messageId: number
 ): Promise<void> {
-  await fetch(`${TELEGRAM_API}/editMessageText`, {
+  await fetch(`${TELEGRAM_API}/deleteMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: parseMode,
-    }),
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
   });
 }
 
-// ارسال عکس
-async function sendPhoto(
+async function sendChatAction(
   chatId: number | string,
-  photoUrl: string,
-  caption?: string
+  action: "typing" | "upload_audio" | "record_audio" = "typing"
 ): Promise<void> {
-  await fetch(`${TELEGRAM_API}/sendPhoto`, {
+  await fetch(`${TELEGRAM_API}/sendChatAction`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      photo: photoUrl,
-      caption,
-      parse_mode: "HTML",
-    }),
+    body: JSON.stringify({ chat_id: chatId, action }),
   });
 }
 
-// ارسال audio از file_id (بدون آپلود مجدد)
+async function answerCallbackQuery(
+  callbackQueryId: string,
+  text: string
+): Promise<void> {
+  await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
+  });
+}
+
+// ── ارسال audio از file_id ───────────────────────────────────
+
 async function sendAudioFromFileId(
   chatId: number | string,
   fileId: string,
@@ -96,8 +120,9 @@ async function sendAudioFromFileId(
   });
 }
 
-// آپلود فایل صوتی و ارسال به کانال و کاربر
-async function uploadAndSendAudio(
+// ── آپلود فایل صوتی ──────────────────────────────────────────
+
+async function uploadAudio(
   filePath: string,
   targetChatId: number | string,
   title: string,
@@ -128,7 +153,7 @@ async function uploadAndSendAudio(
     return null;
   }
 
-  const data = await response.json() as {
+  const data = (await response.json()) as {
     ok: boolean;
     result: {
       message_id: number;
@@ -144,238 +169,216 @@ async function uploadAndSendAudio(
   };
 }
 
-// فوروارد پیام از کانال به کاربر
-async function forwardMessage(
-  fromChatId: string | number,
-  toChatId: string | number,
-  messageId: number
-): Promise<boolean> {
-  const response = await fetch(`${TELEGRAM_API}/forwardMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from_chat_id: fromChatId,
-      chat_id: toChatId,
-      message_id: messageId,
-    }),
-  });
+// ── کپشن ──────────────────────────────────────────────────────
 
-  return response.ok;
+function formatCaption(
+  trackName: string,
+  artistName: string,
+  durationMs: number,
+  fromArchive: boolean
+): string {
+  const duration = durationMs
+    ? `${Math.floor(durationMs / 60000)}:${String(
+        Math.floor((durationMs % 60000) / 1000)
+      ).padStart(2, "0")}`
+    : "";
+  const archiveBadge = fromArchive ? "♻️ از آرشیو" : "🆕 تازه دانلود";
+
+  return (
+    `🎵 <b>${trackName}</b>\n` +
+    `👤 ${artistName}\n` +
+    (duration ? `⏱ ${duration}\n` : "") +
+    `\n${archiveBadge} | @${process.env.BOT_USERNAME || "MusicArchiveBot"}`
+  );
 }
 
-// ارسال پیام در حال تایپ
-async function sendChatAction(
-  chatId: number | string,
-  action: "typing" | "upload_audio" | "record_audio" = "typing"
-): Promise<void> {
-  await fetch(`${TELEGRAM_API}/sendChatAction`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, action }),
-  });
-}
+// ── استخراج عنوان از عنوان YouTube ────────────────────────────
 
-// ارسال پیام وضعیت
-async function sendStatusMessage(
-  chatId: number | string,
-  text: string
-): Promise<number> {
-  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-    }),
-  });
-  const data = await response.json() as { result: { message_id: number } };
-  return data.result.message_id;
-}
+function cleanYoutubeTitle(title: string): {
+  trackName: string;
+  artistName: string;
+} {
+  const cleaned = title
+    .replace(/\[[^\]]*\]/g, "")
+    .replace(/\([^)]*\)/g, "")
+    .replace(
+      /\b(official|video|audio|lyrics|lyric|hd|hq|4k|mv|music video|ft\.?|feat\.?|featuring)\b/gi,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
 
-// حذف پیام
-async function deleteMessage(
-  chatId: number | string,
-  messageId: number
-): Promise<void> {
-  await fetch(`${TELEGRAM_API}/deleteMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
-  });
-}
-
-// پردازش اصلی درخواست آهنگ
-export async function processSpotifyRequest(
-  chatId: number,
-  userId: number,
-  username: string | undefined,
-  spotifyUrl: string
-): Promise<void> {
-  // استخراج Spotify Track ID
-  const trackId = extractSpotifyTrackId(spotifyUrl);
-  if (!trackId) {
-    await sendMessage(
-      chatId,
-      "❌ لینک اسپوتیفای معتبر نیست!\n\nلطفاً یک لینک آهنگ اسپوتیفای بفرستید:\n<code>https://open.spotify.com/track/...</code>"
-    );
-    return;
+  const parts = cleaned.split(" - ");
+  if (parts.length >= 2) {
+    return {
+      artistName: parts[0].trim() || "Unknown",
+      trackName: parts.slice(1).join(" - ").trim() || cleaned,
+    };
   }
 
-  // ارسال پیام وضعیت
-  const statusMsgId = await sendStatusMessage(
+  return { trackName: cleaned || title, artistName: "Unknown" };
+}
+
+// ── جستجو در آرشیو (دیتابیس) ─────────────────────────────────
+
+async function searchArchiveAndSend(
+  chatId: number,
+  query: string,
+  userId: number,
+  username: string | undefined
+): Promise<boolean> {
+  const results = await searchTracksInDb(query);
+
+  if (results.length === 0) return false;
+
+  const buttons = results.slice(0, 5).map((track) => [
+    {
+      text: `♻️ ${track.trackName} - ${track.artistName}`.slice(0, 60),
+      callback_data: `local:${track.spotifyId}`,
+    },
+  ]);
+
+  buttons.push([
+    {
+      text: "🔍 جستجو در YouTube (دانلود جدید)",
+      callback_data: `ytsearch:${query}`.slice(0, 64),
+    },
+  ]);
+
+  await sendMessage(
     chatId,
-    "🔍 در حال جستجو در آرشیو..."
+    `📚 <b>${results.length}</b> نتیجه در آرشیو پیدا شد:\n\nاگه آهنگ مورد نظرت نیست، دکمه‌ی «جستجو در YouTube» رو بزن.`,
+    "HTML",
+    { inline_keyboard: buttons }
   );
 
   await logUserRequest({
     telegramUserId: userId,
     telegramUsername: username,
-    spotifyUrl,
+    searchQuery: query,
     status: "pending",
   });
 
+  return true;
+}
+
+// ── جستجو در YouTube (۵ نتیجه) ────────────────────────────────
+
+async function searchYouTubeAndShowOptions(
+  chatId: number,
+  query: string,
+  userId: number,
+  username: string | undefined
+): Promise<void> {
+  const statusMsgId = await sendMessage(
+    chatId,
+    `🔍 در حال جستجو در YouTube برای: <b>${query}</b>...`
+  );
+
   try {
-    // ۱. بررسی آرشیو (دیتابیس + Cloudflare KV)
-    const existingTrack = await findTrackBySpotifyId(trackId);
+    const results = await searchYouTubeMultiple(query, 5);
 
-    if (existingTrack?.telegramFileId) {
-      // آهنگ قبلاً دانلود شده - ارسال مستقیم
+    if (!results || results.length === 0) {
       await editMessage(
         chatId,
         statusMsgId,
-        "✅ آهنگ در آرشیو پیدا شد! در حال ارسال..."
+        `❌ هیچ نتیجه‌ای برای "<b>${query}</b>" در YouTube پیدا نشد.`
       );
-
-      const caption = formatCaption(
-        existingTrack.trackName,
-        existingTrack.artistName,
-        existingTrack.albumName || "",
-        existingTrack.durationMs || 0,
-        true
-      );
-
-      await sendAudioFromFileId(chatId, existingTrack.telegramFileId, caption);
-
-      await deleteMessage(chatId, statusMsgId);
-      await logUserRequest({
-        telegramUserId: userId,
-        telegramUsername: username,
-        spotifyUrl,
-        trackId: existingTrack.id,
-        status: "success",
-      });
       return;
     }
 
-    // ۲. گرفتن اطلاعات آهنگ از Spotify
-    await editMessage(
-      chatId,
-      statusMsgId,
-      "🎵 در حال دریافت اطلاعات آهنگ از اسپوتیفای..."
-    );
+    const buttons = results.map((r, i) => {
+      // ذخیره‌ی عنوان تو cache برای موقع دانلود
+      videoTitleCache.set(r.videoId, r.title);
 
-    const trackInfo = await getTrackInfo(trackId);
+      // callback_data حداکثر ۶۴ بایت — پس فقط videoId رو می‌ذاریم
+      return [
+        {
+          text: `🎵 ${i + 1}. ${r.title.slice(0, 50)}${r.title.length > 50 ? "..." : ""}`,
+          callback_data: `ytdl:${r.videoId}`,
+        },
+      ];
+    });
+    buttons.push([{ text: "❌ انصراف", callback_data: "cancel" }]);
 
     await editMessage(
       chatId,
       statusMsgId,
-      `🎵 <b>${trackInfo.trackName}</b>\n👤 ${trackInfo.artistName}\n\n⬇️ در حال دانلود...`
+      `🔍 <b>${results.length}</b> نتیجه در YouTube پیدا شد:\n\nیکی رو انتخاب کن:`,
+      "HTML",
+      { inline_keyboard: buttons }
     );
 
-    // ۳. جستجو در یوتیوب و دانلود
-    const searchQuery = `${trackInfo.artistName} - ${trackInfo.trackName}`;
-    const youtubeResult = await searchYouTube(searchQuery);
+    await logUserRequest({
+      telegramUserId: userId,
+      telegramUsername: username,
+      searchQuery: query,
+      status: "pending",
+    });
+  } catch (err) {
+    console.error("YouTube search error:", err);
+    await editMessage(
+      chatId,
+      statusMsgId,
+      "❌ خطا در جستجو. لطفاً بعداً امتحان کن."
+    );
+  }
+}
 
-    if (!youtubeResult) {
-      await editMessage(
-        chatId,
-        statusMsgId,
-        "❌ متأسفم! آهنگ رو توی یوتیوب پیدا نکردم."
-      );
-      await logUserRequest({
-        telegramUserId: userId,
-        telegramUsername: username,
-        spotifyUrl,
-        status: "failed",
-        errorMessage: "YouTube search failed",
-      });
-      return;
-    }
+// ── دانلود و ارسال آهنگ از YouTube ────────────────────────────
 
-    // ۴. ایجاد پوشه موقت و دانلود
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tgbot-"));
-    const safeFilename = `${trackInfo.artistName} - ${trackInfo.trackName}`
+async function downloadAndSendFromYoutube(
+  chatId: number,
+  videoId: string,
+  videoTitle: string,
+  userId: number,
+  username: string | undefined
+): Promise<void> {
+  const statusMsgId = await sendMessage(
+    chatId,
+    `⬇️ در حال دانلود: <b>${videoTitle.slice(0, 80)}</b>...`
+  );
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tgbot-"));
+
+  try {
+    const { trackName, artistName } = cleanYoutubeTitle(videoTitle);
+    const safeFilename = `${artistName} - ${trackName}`
       .replace(/[^a-zA-Z0-9\u0600-\u06FF\s-]/g, "")
       .substring(0, 80);
 
     await sendChatAction(chatId, "upload_audio");
 
-    let audioFilePath: string | null = null;
-    try {
-      audioFilePath = await downloadFromYouTube(
-        youtubeResult.url,
-        tmpDir,
-        safeFilename
-      );
-    } catch (err) {
-      console.error("Download error:", err);
-      await editMessage(
-        chatId,
-        statusMsgId,
-        "❌ خطا در دانلود آهنگ. لطفاً دوباره امتحان کنید."
-      );
-      await logUserRequest({
-        telegramUserId: userId,
-        telegramUsername: username,
-        spotifyUrl,
-        status: "failed",
-        errorMessage: String(err),
-      });
-      // پاکسازی پوشه موقت
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-      return;
-    }
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const audioFilePath = await downloadFromYouTube(
+      videoUrl,
+      tmpDir,
+      safeFilename
+    );
 
     if (!audioFilePath || !fs.existsSync(audioFilePath)) {
-      await editMessage(
-        chatId,
-        statusMsgId,
-        "❌ فایل صوتی دانلود نشد. لطفاً دوباره امتحان کنید."
-      );
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      await editMessage(chatId, statusMsgId, "❌ فایل دانلود نشد.");
       return;
     }
 
-    // ۵. آپلود به کانال آرشیو
-    await editMessage(
-      chatId,
-      statusMsgId,
-      "📤 در حال آپلود در کانال آرشیو..."
-    );
+    const caption = formatCaption(trackName, artistName, 0, false);
 
-    const caption = formatCaption(
-      trackInfo.trackName,
-      trackInfo.artistName,
-      trackInfo.albumName,
-      trackInfo.durationMs,
-      false
-    );
-
-    const durationSeconds = Math.floor(trackInfo.durationMs / 1000);
-
-    // اول به کانال آرشیو آپلود می‌کنیم
     let telegramFileId = "";
     let channelMsgId = 0;
 
+    // ۱) آپلود به کانال آرشیو
     if (ARCHIVE_CHANNEL_ID) {
-      const uploadResult = await uploadAndSendAudio(
+      await editMessage(
+        chatId,
+        statusMsgId,
+        "📤 در حال آپلود در کانال آرشیو..."
+      );
+      const uploadResult = await uploadAudio(
         audioFilePath,
         ARCHIVE_CHANNEL_ID,
-        trackInfo.trackName,
-        trackInfo.artistName,
-        caption,
-        durationSeconds
+        trackName,
+        artistName,
+        caption
       );
 
       if (uploadResult) {
@@ -384,217 +387,139 @@ export async function processSpotifyRequest(
       }
     }
 
-    if (!telegramFileId) {
-      // اگر کانال تنظیم نشده، مستقیم به کاربر ارسال می‌کنیم
-      const uploadResult = await uploadAndSendAudio(
+    // ۲) ارسال به کاربر
+    if (telegramFileId) {
+      await sendAudioFromFileId(chatId, telegramFileId, caption);
+    } else {
+      const uploadResult = await uploadAudio(
         audioFilePath,
         chatId,
-        trackInfo.trackName,
-        trackInfo.artistName,
-        caption,
-        durationSeconds
+        trackName,
+        artistName,
+        caption
       );
-
       if (!uploadResult) {
-        await editMessage(chatId, statusMsgId, "❌ خطا در آپلود فایل.");
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+        await editMessage(chatId, statusMsgId, "❌ خطا در ارسال.");
         return;
       }
-
       telegramFileId = uploadResult.fileId;
-    } else {
-      // ارسال به کاربر از روی file_id کانال
-      await sendAudioFromFileId(chatId, telegramFileId, caption);
     }
 
-    // ۶. ذخیره در دیتابیس + Cloudflare KV
-    const savedTrack = await saveTrack(
-      trackInfo,
-      telegramFileId,
-      channelMsgId
-    );
+    // ۳) ذخیره در دیتابیس
+    try {
+      await saveTrack(
+        {
+          spotifyId: `yt:${videoId}`,
+          trackName,
+          artistName,
+          albumName: "",
+          coverUrl: "",
+          durationMs: 0,
+          spotifyUrl: videoUrl,
+        },
+        telegramFileId,
+        channelMsgId
+      );
+    } catch (e) {
+      console.error("Save track error:", e);
+      // ذخیره نشد، ولی آهنگ ارسال شد — ادامه می‌دیم
+    }
 
     await logUserRequest({
       telegramUserId: userId,
       telegramUsername: username,
-      spotifyUrl,
-      trackId: savedTrack.id,
+      searchQuery: videoTitle,
       status: "success",
     });
 
-    // ۷. حذف پیام وضعیت
     await deleteMessage(chatId, statusMsgId);
-
-    // ۸. پاکسازی فایل موقت
-    fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch (err) {
-    console.error("processSpotifyRequest error:", err);
+    console.error("Download error:", err);
     await editMessage(
       chatId,
       statusMsgId,
-      "❌ خطایی رخ داد. لطفاً دوباره امتحان کنید."
+      "❌ خطا در دانلود. دوباره امتحان کن."
     );
     await logUserRequest({
       telegramUserId: userId,
       telegramUsername: username,
-      spotifyUrl,
+      searchQuery: videoTitle,
       status: "failed",
       errorMessage: String(err),
     });
-  }
-}
-
-// جستجوی آهنگ (برای وقتی کاربر اسم آهنگ می‌فرسته)
-export async function processSearchRequest(
-  chatId: number,
-  userId: number,
-  username: string | undefined,
-  query: string
-): Promise<void> {
-  // اول در دیتابیس جستجو می‌کنیم
-  const localResults = await searchTracksInDb(query);
-
-  if (localResults.length > 0) {
-    // نتایج محلی پیدا شد
-    const buttons = localResults.map((track) => [
-      {
-        text: `🎵 ${track.trackName} - ${track.artistName}`,
-        callback_data: `local:${track.spotifyId}`,
-      },
-    ]);
-
-    await fetch(`${TELEGRAM_API}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: `🔍 نتایج جستجو برای: <b>${query}</b>\n\n${localResults.length} آهنگ در آرشیو پیدا شد:`,
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: buttons,
-        },
-      }),
-    });
-    return;
-  }
-
-  // جستجو در Spotify
-  const statusMsgId = await sendStatusMessage(
-    chatId,
-    `🔍 در حال جستجو در اسپوتیفای: <b>${query}</b>...`
-  );
-
-  try {
-    const spotifyResults = await searchSpotify(query);
-
-    if (spotifyResults.length === 0) {
-      await editMessage(
-        chatId,
-        statusMsgId,
-        `❌ هیچ آهنگی برای "<b>${query}</b>" پیدا نشد.`
-      );
-      return;
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore
     }
-
-    const buttons = spotifyResults.map((track) => [
-      {
-        text: `🎵 ${track.trackName} - ${track.artistName}`,
-        callback_data: `spotify:${track.spotifyId}`,
-      },
-    ]);
-
-    await editMessage(
-      chatId,
-      statusMsgId,
-      `🔍 نتایج جستجو برای: <b>${query}</b>\n\n${spotifyResults.length} آهنگ پیدا شد:`
-    );
-
-    await fetch(`${TELEGRAM_API}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: "یکی از آهنگ‌های زیر رو انتخاب کن:",
-        reply_markup: {
-          inline_keyboard: buttons,
-        },
-      }),
-    });
-  } catch (err) {
-    console.error("Search error:", err);
-    await editMessage(
-      chatId,
-      statusMsgId,
-      "❌ خطا در جستجو. لطفاً از لینک مستقیم اسپوتیفای استفاده کنید."
-    );
   }
 }
 
-// پردازش callback query (وقتی کاربر روی دکمه می‌زنه)
-export async function processCallbackQuery(
+// ── ارسال آهنگ از آرشیو ──────────────────────────────────────
+
+async function sendArchiveTrack(
+  chatId: number,
+  spotifyId: string
+): Promise<void> {
+  const track = await findTrackBySpotifyId(spotifyId);
+  if (track?.telegramFileId) {
+    const caption = formatCaption(
+      track.trackName,
+      track.artistName,
+      track.durationMs || 0,
+      true
+    );
+    await sendAudioFromFileId(chatId, track.telegramFileId, caption);
+  } else {
+    await sendMessage(chatId, "❌ این آهنگ در آرشیو پیدا نشد.");
+  }
+}
+
+// ── callback query ────────────────────────────────────────────
+
+async function processCallbackQuery(
   callbackQueryId: string,
   chatId: number,
   userId: number,
   username: string | undefined,
   data: string
 ): Promise<void> {
-  // جواب دادن به callback
-  await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      callback_query_id: callbackQueryId,
-      text: "⏳ در حال پردازش...",
-    }),
-  });
+  const colonIdx = data.indexOf(":");
+  const type = colonIdx === -1 ? data : data.slice(0, colonIdx);
+  const value = colonIdx === -1 ? "" : data.slice(colonIdx + 1);
 
-  const [type, spotifyId] = data.split(":");
+  if (type === "cancel") {
+    await answerCallbackQuery(callbackQueryId, "لغو شد.");
+    await sendMessage(chatId, "❌ لغو شد.");
+    return;
+  }
+
+  await answerCallbackQuery(callbackQueryId, "⏳ در حال پردازش...");
 
   if (type === "local") {
-    // آهنگ از آرشیو محلی
-    const track = await findTrackBySpotifyId(spotifyId);
-    if (track?.telegramFileId) {
-      const caption = formatCaption(
-        track.trackName,
-        track.artistName,
-        track.albumName || "",
-        track.durationMs || 0,
-        true
-      );
-      await sendAudioFromFileId(chatId, track.telegramFileId, caption);
-    }
-  } else if (type === "spotify") {
-    // دانلود از اسپوتیفای
-    const spotifyUrl = `https://open.spotify.com/track/${spotifyId}`;
-    await processSpotifyRequest(chatId, userId, username, spotifyUrl);
+    await sendArchiveTrack(chatId, value);
+  } else if (type === "ytsearch") {
+    await searchYouTubeAndShowOptions(chatId, value, userId, username);
+  } else if (type === "ytdl") {
+    const videoId = value;
+    const videoTitle = videoTitleCache.get(videoId) || "Unknown";
+    await downloadAndSendFromYoutube(
+      chatId,
+      videoId,
+      videoTitle,
+      userId,
+      username
+    );
   }
 }
 
-// فرمت کردن کپشن آهنگ
-function formatCaption(
-  trackName: string,
-  artistName: string,
-  albumName: string,
-  durationMs: number,
-  fromArchive: boolean
-): string {
-  const duration = durationMs ? formatDuration(durationMs) : "";
-  const archiveBadge = fromArchive ? "♻️ از آرشیو" : "🆕 تازه دانلود";
+// ── handle Telegram Update ────────────────────────────────────
 
-  return (
-    `🎵 <b>${trackName}</b>\n` +
-    `👤 ${artistName}\n` +
-    (albumName ? `💿 ${albumName}\n` : "") +
-    (duration ? `⏱ ${duration}\n` : "") +
-    `\n${archiveBadge} | @${process.env.BOT_USERNAME || "MusicArchiveBot"}`
-  );
-}
-
-// پردازش پیام‌های ورودی از webhook
 export async function handleTelegramUpdate(
   update: TelegramUpdate
 ): Promise<void> {
-  // پردازش callback query
+  // callback query
   if (update.callback_query) {
     const { id, from, message, data } = update.callback_query;
     if (message && data) {
@@ -615,41 +540,37 @@ export async function handleTelegramUpdate(
   const chatId = message.chat.id;
   const userId = message.from?.id || 0;
   const username = message.from?.username;
-  const text = message.text || "";
+  const text = (message.text || "").trim();
 
-  // دستور /start
+  // /start
   if (text === "/start" || text.startsWith("/start ")) {
     await sendMessage(
       chatId,
-      `🎵 <b>به ربات موزیک خوش اومدی!</b>\n\n` +
-        `می‌تونی:\n` +
-        `• لینک اسپوتیفای بفرستی 🔗\n` +
-        `• اسم آهنگ رو جستجو کنی 🔍\n\n` +
+      `🎵 <b>به ربات موزیک Nivaro خوش اومدی!</b>\n\n` +
+        `کافیه اسم آهنگ یا خواننده رو بفرستی، من از YouTube برات پیدا و دانلود می‌کنم 🎧\n\n` +
         `<b>مثال:</b>\n` +
-        `<code>https://open.spotify.com/track/...</code>\n` +
-        `یا فقط اسم آهنگ رو بنویس:\n` +
-        `<code>Bohemian Rhapsody</code>\n\n` +
+        `<code>Bohemian Rhapsody</code>\n` +
+        `<code>Eminem Lose Yourself</code>\n\n` +
         `📦 آرشیو کامل موزیک در کانال ما!`
     );
     return;
   }
 
-  // دستور /help
+  // /help
   if (text === "/help") {
     await sendMessage(
       chatId,
       `❓ <b>راهنما</b>\n\n` +
-        `1️⃣ لینک اسپوتیفای بفرست:\n` +
-        `<code>https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh</code>\n\n` +
-        `2️⃣ اسم آهنگ یا خواننده رو بنویس:\n` +
+        `1️⃣ اسم آهنگ یا خواننده رو بنویس:\n` +
         `<code>Eminem Lose Yourself</code>\n\n` +
-        `3️⃣ ربات آهنگ رو پیدا و ارسال می‌کنه! 🎶\n\n` +
-        `📌 آهنگ‌های قبلاً دانلود شده از آرشیو کانال ارسال می‌شن (سریع‌تر!)`
+        `2️⃣ بات ۵ نتیجه از YouTube می‌آره، یکیش رو انتخاب کن\n\n` +
+        `3️⃣ بات دانلود می‌کنه و برات می‌فرسته! 🎶\n\n` +
+        `📌 آهنگ‌های قبلاً دانلود شده از آرشیو ارسال می‌شن (سریع‌تر!)`
     );
     return;
   }
 
-  // دستور /stats
+  // /stats
   if (text === "/stats") {
     try {
       const { getStats } = await import("./trackService");
@@ -673,25 +594,34 @@ export async function handleTelegramUpdate(
     return;
   }
 
-  // بررسی آیا لینک اسپوتیفایه
-  if (text.includes("spotify.com/track/") || text.includes("spotify:track:")) {
-    const urlMatch = text.match(
-      /(https?:\/\/open\.spotify\.com\/track\/[a-zA-Z0-9?=&]+|spotify:track:[a-zA-Z0-9]+)/
+  // اگه لینک Spotify بود، فقط راهنمایی کن
+  if (text.includes("spotify.com/") || text.includes("spotify:")) {
+    await sendMessage(
+      chatId,
+      `⚠️ لینک Spotify پشتیبانی نمی‌شه.\n\nلطفاً <b>اسم آهنگ و خواننده</b> رو بفرست:\n<code>Bohemian Rhapsody Queen</code>`
     );
-    if (urlMatch) {
-      await processSpotifyRequest(chatId, userId, username, urlMatch[0]);
-      return;
-    }
+    return;
   }
 
   // جستجوی متنی
   if (text.length >= 2 && !text.startsWith("/")) {
-    await processSearchRequest(chatId, userId, username, text);
+    // اول تو آرشیو بگرد
+    const foundInArchive = await searchArchiveAndSend(
+      chatId,
+      text,
+      userId,
+      username
+    );
+    if (foundInArchive) return;
+
+    // اگه تو آرشیو نبود، YouTube رو سرچ کن
+    await searchYouTubeAndShowOptions(chatId, text, userId, username);
     return;
   }
 }
 
-// تایپ‌های تلگرام
+// ── تایپ‌های تلگرام ──────────────────────────────────────────
+
 export interface TelegramUpdate {
   update_id: number;
   message?: {
